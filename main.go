@@ -4,17 +4,15 @@
 package main
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	"encoding/csv"
-	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
+	"fyne.io/fyne/v2"
+	"github.com/Rldeckard/aesGenerate256/authGen"
 	"github.com/go-ping/ping"
 	g "github.com/gosnmp/gosnmp"
 	"github.com/spf13/viper"
@@ -67,69 +65,28 @@ func readCSV(filename string) ([][]string, error) {
 	return lines, err
 }
 
+var myWindow fyne.Window
+
 func main() {
 	readCSV("devices.csv")
 	viper.AddConfigPath("configs")
 	viper.SetConfigName("snmpHelper") // Register config file name (no extension)
 	viper.SetConfigType("yml")        // Look for specific type
-	err := viper.ReadInConfig()
-	CheckError(err)
+	viper.ReadInConfig()
 
-	var ipList = strings.Split(viper.GetString("params.ipList"), ",")
-
-	start := time.Now()
-	var waitGroup sync.WaitGroup
-	count := 0
-	filePath, err := os.Getwd()
-	fmt.Println(time.Now().Format("2006-01-02T15:04:05") + ": Script Started. Refer to CSV file for output" + filePath + "\\devices.csv")
-	for _, ipGate := range ipList {
-		netID := strings.Split(ipGate, ".")
-		for i := 2; i <= 254; i++ {
-			ipAddr := netID[0] + "." + netID[1] + "." + netID[2] + "." + strconv.Itoa(i)
-			waitGroup.Add(1)
-			go func() {
-				defer waitGroup.Done()
-				snmpScan(ipAddr, viper.GetString("snmpHelper.appHead"), viper.GetString("snmpHelper.appTrail"))
-			}()
-			if count > 200 { //only allows 200 routines at once. TODO: Needs replaced with real logic at some point to manage snmp connections.
-				time.Sleep(time.Duration(viper.GetInt("blockTimer.goRouteTimeout")) * time.Millisecond)
-				count = 0
-			}
-			count++
-		}
-	}
-	fmt.Println(time.Now().Format("2006-01-02T15:04:05") + ": All scans generated. Waiting for completion")
-	waitGroup.Wait()
-
-	duration := time.Since(start)
-	fmt.Println(time.Now().Format("2006-01-02T15:04:05") + ": Scan completed in: " + fmt.Sprint(duration))
-	os.Exit(0x0)
+	guiApp()
 
 }
 
-func passBall(ct string) string {
-	var plaintext []byte
-	appCode := "asdfaASDfdasaEGtei4339szv$^2faki"
-	ciphertext, _ := hex.DecodeString(ct)
-	c, err := aes.NewCipher([]byte(appCode))
-	CheckError(err)
-
-	gcm, err := cipher.NewGCM(c)
-	CheckError(err)
-
-	nonceSize := gcm.NonceSize()
-	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
-
-	plaintext, err = gcm.Open(nil, []byte(nonce), []byte(ciphertext), nil)
-	CheckError(err)
-
-	return string(plaintext)
-}
-
-func snmpScan(target string, appHead string, appTrail string) {
+func snmpScan(target string, v2community string) {
 
 	var m sync.Mutex
 	var snmpString string
+	appCode := "asdfaASDfdasaEGtei4339szv$^2faki"
+	if v2community == "" {
+		log.Fatalln("Community String not provided.")
+		os.Exit(1)
+	}
 	pinger, pingErr := ping.NewPinger(target)
 	if pingErr != nil {
 		m.Lock()
@@ -155,11 +112,11 @@ func snmpScan(target string, appHead string, appTrail string) {
 		MsgFlags:      g.AuthPriv,
 		Timeout:       time.Duration(viper.GetInt("blockTimer.snmpTimeout")) * time.Second,
 		SecurityParameters: &g.UsmSecurityParameters{
-			UserName:                 passBall(viper.GetString("snmpHelper.appHead")),
+			UserName:                 aes256.Decrypt(appCode, viper.GetString("snmpHelper.appHead")),
 			AuthenticationProtocol:   g.SHA,
-			AuthenticationPassphrase: passBall(viper.GetString("snmpHelper.appTrail")),
+			AuthenticationPassphrase: aes256.Decrypt(appCode, viper.GetString("snmpHelper.appTrail")),
 			PrivacyProtocol:          g.AES,
-			PrivacyPassphrase:        passBall(viper.GetString("snmpHelper.appTrail")),
+			PrivacyPassphrase:        aes256.Decrypt(appCode, viper.GetString("snmpHelper.appTrail")),
 		},
 	}
 	snmpString = "ts_v3"
@@ -193,17 +150,17 @@ func snmpScan(target string, appHead string, appTrail string) {
 	result, err := params.Get(oids) // Get() accepts up to g.MAX_OIDS
 	if err != nil {
 		params.Version = g.Version2c
-		params.Community = "blast"
+		params.Community = v2community
 		legacyResult, err := params.Get(oids)
 		snmpString = "legacy_v2"
 		if err != nil {
 			params.Version = g.Version3
 			params.SecurityParameters = &g.UsmSecurityParameters{
-				UserName:                 passBall(viper.GetString("snmpHelper.appHead")),
+				UserName:                 aes256.Decrypt(appCode, viper.GetString("snmpHelper.appHead")),
 				AuthenticationProtocol:   g.SHA,
-				AuthenticationPassphrase: passBall(viper.GetString("snmpHelper.appTrail")),
+				AuthenticationPassphrase: aes256.Decrypt(appCode, viper.GetString("snmpHelper.appTrail")),
 				PrivacyProtocol:          g.AES256C,
-				PrivacyPassphrase:        passBall(viper.GetString("snmpHelper.appTrail")),
+				PrivacyPassphrase:        aes256.Decrypt(appCode, viper.GetString("snmpHelper.appTrail")),
 			}
 			snmpString = "cisco_v3"
 			_, err := params.Get(oids)
