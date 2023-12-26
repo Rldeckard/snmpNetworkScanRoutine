@@ -6,34 +6,20 @@ package main
 import (
 	"encoding/csv"
 	"fmt"
-	"log"
 	"os"
 	"sync"
 	"time"
 
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2"
-	"github.com/Rldeckard/aesGenerate256/authGen"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/widget"
+
+	//"github.com/Rldeckard/aesGenerate256/authGen"
 	"github.com/go-ping/ping"
 	g "github.com/gosnmp/gosnmp"
 	"github.com/spf13/viper"
 )
-
-// blocking sleeps. Adjust these to improve speed OR reliability
-var snmpTimeout = 5      //seconds. Higher = better data integrity
-var pingCount = 5        //retries. Higher = reliable device count
-var pingTimeout = 2000   //milliseconds
-var goRouteTimeout = 800 //milliseconds. Limits concurrent operations to avoid overloading open ports for snmp. Potentially 10k+ active connections from the server while this runs
-
-func loadConfig(path string) (config interface{}, err error) {
-
-	if err != nil {
-		return
-	}
-
-	//err = viper.Unmarshal(&config) //pulls from package
-	return
-
-}
 
 type Device struct {
 	Hostname string
@@ -66,60 +52,78 @@ func readCSV(filename string) ([][]string, error) {
 }
 
 var myWindow fyne.Window
+var snmpUser *widget.Entry
+var snmpPriv *widget.Entry
+var snmpAuth *widget.Entry
+var resultsTable *fyne.Container
+var content *fyne.Container
+
 
 func main() {
 	readCSV("devices.csv")
-	viper.AddConfigPath("configs")
-	viper.SetConfigName("snmpHelper") // Register config file name (no extension)
-	viper.SetConfigType("yml")        // Look for specific type
-	viper.ReadInConfig()
+	
 
 	guiApp()
 
 }
 
-func snmpScan(target string, v2community string) {
+func snmpScan(target string, community string, oids []string, snmpType string) {
 
 	var m sync.Mutex
-	var snmpString string
-	appCode := "asdfaASDfdasaEGtei4339szv$^2faki"
-	if v2community == "" {
-		log.Fatalln("Community String not provided.")
-		os.Exit(1)
+	//var snmpString string
+	//appCode := "asdfaASDfdasaEGtei4339szv$^2faki"
+	if community == "" {
+		dialog.NewCustom("Oops", "Close", widget.NewLabel("Community string not detected."), myWindow).Show()
 	}
+	viper.AddConfigPath("configs")
+	viper.SetConfigName("snmpHelper") // Register config file name (no extension)
+	viper.SetConfigType("yml")        // Look for specific type
+	viper.ReadInConfig()
 	pinger, pingErr := ping.NewPinger(target)
 	if pingErr != nil {
 		m.Lock()
 		defer m.Unlock()
 		appendToCSV(target + ", Ping creation failed?\n")
 	}
-
-	pinger.Count = viper.GetInt("blockTimer.pingCount")
+	pinger.Count = 3
 	pinger.SetPrivileged(true)
-	pinger.Timeout = time.Duration(viper.GetInt("blockTimer.pingTimeout")) * time.Millisecond //times out after 500 milliseconds
+	pinger.Timeout = 2000 * time.Millisecond //times out after 500 milliseconds
 	pinger.Run()                                                                              // blocks until finished
-	stats := pinger.Statistics()                                                              // get send/receive/rtt stats
+	stats := pinger.Statistics()      
+	rows := container.NewGridWithColumns(
+		5,
+		widget.NewLabel(target),
+	)                                                        
+	// get send/receive/rtt stats
 	if stats.PacketsRecv == 0 {
-		//Device Timed out. No need to make a list of available iPs. Exit function.
+		//no need to return down devices.
 		return
 	}
 	// build our own GoSNMP struct, rather than using g.Default
 	params := g.GoSNMP{
 		Target:        target,
 		Port:          161,
-		Version:       g.Version3,
 		SecurityModel: g.UserSecurityModel,
 		MsgFlags:      g.AuthPriv,
-		Timeout:       time.Duration(viper.GetInt("blockTimer.snmpTimeout")) * time.Second,
-		SecurityParameters: &g.UsmSecurityParameters{
-			UserName:                 aes256.Decrypt(appCode, viper.GetString("snmpHelper.appHead")),
-			AuthenticationProtocol:   g.SHA,
-			AuthenticationPassphrase: aes256.Decrypt(appCode, viper.GetString("snmpHelper.appTrail")),
-			PrivacyProtocol:          g.AES,
-			PrivacyPassphrase:        aes256.Decrypt(appCode, viper.GetString("snmpHelper.appTrail")),
-		},
+		Timeout:       3 * time.Second,
 	}
-	snmpString = "ts_v3"
+	if snmpType == "v3" {
+		params.Version = g.Version3
+		params.SecurityParameters = &g.UsmSecurityParameters{
+			UserName:                 snmpUser.Text,
+			AuthenticationProtocol:   g.SHA,
+			AuthenticationPassphrase: snmpAuth.Text,
+			PrivacyProtocol:          g.AES256C,
+			PrivacyPassphrase:        snmpPriv.Text,
+		}
+	} else if snmpType == "v2" {
+		params.Version = g.Version2c
+		params.Community = community
+	} else {
+		params.Version = g.Version1
+		params.Community = community
+	}
+
 
 	err := params.Connect()
 	if err != nil {
@@ -129,66 +133,36 @@ func snmpScan(target string, v2community string) {
 		return
 	}
 	defer params.Conn.Close()
-
-	oids := []string{
-		"1.3.6.1.2.1.1.5.0",                     //hostname
-		".1.3.6.1.4.1.868.2.3.1.1.1.1.6.1",      //hostname TS
-		".1.3.6.1.2.1.16.19.2.0",                //cisco version
-		"1.3.6.1.4.1.868.2.80.2.1.1.1.1.2.0",    //TS model
-		"1.3.6.1.4.1.868.2.80.2.1.1.1.1.2.1",    //TS model backup
-		"1.3.6.1.4.1.868.2.80.2.1.1.1.1.10.0",   //TS version
-		"1.3.6.1.4.1.868.2.80.2.1.1.1.1.10.1",   //TS version backup
-		".1.3.6.1.4.1.5205.2.166.1.1.1.1.10.0",  //TS version backup backup idk man
-		"1.3.6.1.4.1.868.2.3.1.1.1.1.10.1",      //TS version yup
-		"1.3.6.1.4.1.868.2.80.2.1.1.1.1.14.0",   //TS mac address
-		"1.3.6.1.4.1.868.2.80.2.1.1.1.1.14.1",   //TS mac address backup
-		".1.3.6.1.4.1.5205.2.166.1.1.1.1.14.0",  //TS mac address backup backup
-		".1.3.6.1.4.1.868.2.3.1.1.1.1.5.1",      //TS mac address back back back
-		"1.3.6.1.4.1.868.2.80.2.1.3.1.1.1.2.1",  //TS local user
-		".1.3.6.1.4.1.5205.2.166.1.3.1.1.1.2.1", //TS local user backup
-	}
-	result, err := params.Get(oids) // Get() accepts up to g.MAX_OIDS
+	
+	result, err := params.Get(oids)
+	
 	if err != nil {
-		params.Version = g.Version2c
-		params.Community = v2community
-		legacyResult, err := params.Get(oids)
-		snmpString = "legacy_v2"
-		if err != nil {
-			params.Version = g.Version3
-			params.SecurityParameters = &g.UsmSecurityParameters{
-				UserName:                 aes256.Decrypt(appCode, viper.GetString("snmpHelper.appHead")),
-				AuthenticationProtocol:   g.SHA,
-				AuthenticationPassphrase: aes256.Decrypt(appCode, viper.GetString("snmpHelper.appTrail")),
-				PrivacyProtocol:          g.AES256C,
-				PrivacyPassphrase:        aes256.Decrypt(appCode, viper.GetString("snmpHelper.appTrail")),
-			}
-			snmpString = "cisco_v3"
-			_, err := params.Get(oids)
-			if err != nil {
-				m.Lock()
-				defer m.Unlock()
-				appendToCSV(target + ", SNMP connect timed out, " + err.Error()) //converts error type to string
-				return
-			} else {
-				//no need to return cisco results
-				return
-			}
-		} else {
-			result = legacyResult
-
-		}
-
-	}
-	snmpOutput := target
-
-	for _, variable := range result.Variables {
-		if variable.Value != nil {
-			snmpOutput += "," + string(variable.Value.([]byte))
-		}
+		rows.Add(widget.NewLabel("Alive, but no SNMP data"))
+		m.Lock()
+		resultsTable.Add(rows)
+		m.Unlock()
+		return
 	}
 	m.Lock()
-	defer m.Unlock()
-	appendToCSV(snmpOutput + "," + snmpString)
+	for _, variable := range result.Variables {
+		if variable.Value != nil {
+			switch v := variable.Value.(type) {
+			case string: 
+				fmt.Println(variable.Value.(string))
+				rows.Add(widget.NewLabel(variable.Value.(string)))
+			case []uint8:
+				rows.Add(widget.NewLabel(string(v)))
+			case int:
+				rows.Add(widget.NewLabel(fmt.Sprint(v)))
+			default: 
+				fmt.Println(v)
+				rows.Add(widget.NewLabel("Unhandled SNMP error "))
+			}
+		}
+	}
+	resultsTable.Add(rows)
+	m.Unlock()
+
 
 }
 
